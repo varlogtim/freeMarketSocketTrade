@@ -172,6 +172,28 @@ bool parseArgs(int argc, char *argv[], int *numTraders, int *numTrades)
     return true;
 }
 
+/*
+ * OK, more information about the client/server architecture...
+ * The accept() and connect() functions both block.
+ * The server must accept() and the clients must connect()
+ * 
+ * We could have the "master" facilitate all the "trades"
+ * but I would like each of them to have a connection to
+ * the other servers.
+ *
+ * First: the connection from the parent to all the child:
+ *
+ * So, in order to do this, we need to spawn the children
+ * and have each of them call connect() and wait until the
+ * parent calls accept(). We need to make sure there are
+ * enough backlog slots configured for this.
+ *
+ * Hrmm... yeah ... I should just get the master/broker
+ * model working first.
+ *
+ */
+
+
 class UnixDomainSocket_DERP {
   public:
     UnixDomainSocket_DERP(const char *socketPath);
@@ -189,29 +211,26 @@ struct UnixDomainSocket {
     char socketPath[PATH_MAX];
     struct sockaddr_un addr;
     socklen_t addrsize;
+    int numPeers;
     int socketFd;
 };
 
-bool prepareUnixDomainSocket(const char *socketPath, UnixDomainSocket *uds) {
-    strcpy(uds->socketPath, socketPath);
+
+bool serverSetup(const char *socketPath, int numPeers, UnixDomainSocket *uds) {
+    // TODO: See comment at top of clientConnect()
+    memset(&uds->addr, '\0', sizeof(struct sockaddr_un));
 
     uds->socketFd = socket(AF_UNIX, SOCK_STREAM, 0);
     uds->addrsize = sizeof(struct sockaddr_un);
-
-    memset(&uds->addr, '\0', uds->addrsize);
-
     uds->addr.sun_family = AF_UNIX;
+
+    strcpy(uds->socketPath, socketPath);
     strncpy(uds->addr.sun_path, uds->socketPath, sizeof(uds->addr.sun_path) - 1);
 
-    return true;
-}
-
-bool serverSetup(UnixDomainSocket *uds) {
-    //std::cout << "Server waiting 10 seconds" << std::endl;
-    //sleep(10);
-    int bindReturn = bind(
+    int status;
+    status = bind(
             uds->socketFd, (struct sockaddr *) &uds->addr, uds->addrsize);
-    if (bindReturn == -1) {
+    if (status == -1) {
         std::cerr << "Failed to bind to address: " 
             << std::strerror(errno) << std::endl;
         return false;
@@ -219,43 +238,118 @@ bool serverSetup(UnixDomainSocket *uds) {
         std::cout << "Bind Success" << std::endl;
     }
     
-    int listenRet = listen(uds->socketFd, 1);
-    if (listenRet == -1) {
+    int backlog = 5; // XXX needed? maybe numPeers
+    status = listen(uds->socketFd, backlog);
+    if (status == -1) {
         std::cerr << "Failed to listen to address: " 
             << std::strerror(errno) << std::endl;
         return false;
-    } else {
-        std::cout << "Listen Success" << std::endl;
     }
 
-    int acceptRet = accept(
-            uds->socketFd, (struct sockaddr *) &uds->addr, &uds->addrsize);
-    if (acceptRet == -1) {
-        std::cerr << "accept failed: " << std::strerror(errno) << std::endl;
+    std::cout << "Server Listen Successful: "
+        << "Socket FD: " << uds->socketFd << " "
+        << "Socket Path: " << uds->addr.sun_path << std::endl;
+
+    return true;
+
+}
+
+bool clientConnect(const char *socketPath, UnixDomainSocket *uds) {
+    // Note to self: We might be able to reuse this pattern from
+    // the serverSetup() ... I think there was a memset issue which
+    // caused my problem yesterday. Yeah, actually, if I made the
+    // UnixDomainSocket a more generic structure and created it
+    // outside of this function, it wouldn't matter if it were
+    // in the UNIX or INET communication domain.
+    memset(&uds->addr, '\0', sizeof(struct sockaddr_un));
+
+    uds->socketFd = socket(AF_UNIX, SOCK_STREAM, 0);
+    uds->addrsize = sizeof(struct sockaddr_un);
+    uds->addr.sun_family = AF_UNIX;
+
+    strcpy(uds->socketPath, socketPath);
+    strncpy(uds->addr.sun_path, uds->socketPath, sizeof(uds->addr.sun_path) - 1);
+
+    int status = connect(
+            uds->socketFd, (struct sockaddr *) &uds->addr, uds->addrsize);
+
+    if (status == -1) {
+        std::cout << "Client Connection Failed: " 
+            << std::strerror(errno) << std::endl;
         return false;
-    } else {
-        std::cout << "Accept Success" << std::endl;
     }
+
+    std::cout << "Client Connection Successful: "
+        << "Socket FD: " << uds->socketFd << " "
+        << "Socket Path: " << uds->addr.sun_path << std::endl;
+    // this blocks too
     return true;
 }
 
-bool clientConnect(UnixDomainSocket *uds) {
-    int numTries = 1;
-    std::cout << "uds->addr: " << uds->addr.sun_path << std::endl;
-    for (int ii = 0; ii < numTries; ii++) {
-        int connectRet = connect(
-                uds->socketFd, (struct sockaddr *) &uds->addr, (socklen_t) uds->addrsize);
-        if (connectRet == -1) {
-            std::cout << "connect " << ii << " failed: " 
-                << std::strerror(errno) << ": Retrying ..." << std::endl;
-        } else {
-            std::cout << "Connection successful" << std::endl;
-            break;
-        }
-        sleep(1);
+int clientProcess(const char *socketPath)
+{
+    // TODO: better error handling
+    UnixDomainSocket *uds = nullptr;
+    uds = (UnixDomainSocket *) malloc(sizeof(UnixDomainSocket));
+    if (!uds) return 1;
+
+    bool status;
+    status = clientConnect(socketPath, uds);
+    if (!status) return 1;
+    
+    std::string data("Hello, yo!");
+
+    int writeBytes;
+    writeBytes = write(uds->socketFd, data.c_str(), data.size());
+    std::cout << "writeBytes: " << writeBytes << std::endl;
+
+    return 0;
+}
+
+int masterProcess(const char *socketPath, int numPeers)
+{
+    UnixDomainSocket *uds = nullptr;
+    uds = (UnixDomainSocket *) malloc(sizeof(UnixDomainSocket));
+    if (!uds) return 1;
+
+    bool status;
+    status = serverSetup(socketPath, numPeers, uds);
+    if (!status) return 1;
+
+    int buffSize = 1000;
+    char buff[buffSize];
+
+    /*
+    */
+
+    // So ... it turns out that when we accept a connection, we create
+    // another file descriptor which is what we read from. I suppose this
+    // makes sense as streams are bidirectional. The question is, when we
+    // write from the server to the client, do we write to cfd or sfd?
+    // - Hrm.. docs say accept "optionally returns address of peer socket"
+    int cfd = accept(uds->socketFd, nullptr, nullptr);
+            //uds->socketFd, (struct sockaddr *) &uds->addr, &uds->addrsize);
+
+    // so... accept overwrites the uds->addr struct on connect, if specified.
+
+    // blocks until connect.
+    if (cfd == -1) {
+        std::cerr << "accept failed: " << std::strerror(errno) << std::endl;
+        return false;
+    } else {
+        std::cout << "Server accept file descriptor: " << cfd << std::endl;
     }
-    // this blocks too
-    return true;
+    int bytesRead;
+
+    std::string data("");
+    while((bytesRead = read(cfd, buff, buffSize)) > 0) {
+        data.append(std::string(buff), 0, bytesRead);
+    }
+    if (bytesRead == -1) {
+        std::cerr << "read failed: " << std::strerror(errno) << std::endl;
+    }
+    std::cout << "Data read: '" << data << "'" << std::endl;
+    return 0;
 }
 
 int main(int argc, char *argv[]) {
@@ -271,40 +365,32 @@ int main(int argc, char *argv[]) {
         exit(1);
     }
 
+    /*
     Trader person1 = Trader(1, 100);
 
     for (int ii = *numTrades; ii--; ) {
         person1.buy(2, 13);
     }
+    */
 
-    UnixDomainSocket *serverUds = nullptr;
-    UnixDomainSocket *clientUds = nullptr;
-    serverUds = (UnixDomainSocket *) malloc(sizeof(UnixDomainSocket));
-    clientUds = (UnixDomainSocket *) malloc(sizeof(UnixDomainSocket));
     const char *socketPath = "/tmp/test.sock";
 
-
     pid_t pid = fork();
-    std::cout << "PID PID: " << pid << std::endl;
     if (pid > 0) {
         // parent
-        if(!prepareUnixDomainSocket(socketPath, serverUds)) {
-            std::cerr << "Failed to prepare server socket" << std::endl;
-        }
-        serverSetup(serverUds);
+        masterProcess(socketPath, *numTraders);
     } else {
         if (pid == 0) {
             // child
-            if(!prepareUnixDomainSocket(socketPath, clientUds)) {
-                std::cerr << "Failed to prepare client socket" << std::endl;
-            }
-            clientConnect(clientUds);
+            clientProcess(socketPath);
             exit(0);
         } else {
             // error
             std::cerr << "Error spawning child" << std::endl;
         }
     }
+
+    unlink(socketPath);
     return 0;
 }
 
